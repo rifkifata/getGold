@@ -1,0 +1,8 @@
+1. node login.js
+2. scan qr code ->pastikan ada .wwebjs_auth folder kebentuk
+3. node zip-upload -> upload ke storegae supabase
+4. node index.js -> 
+    a. remove folder .wwebjs_auth di container render.com
+    b. unzip folder dari storage supabase dan masukkan ke container .wwebjs_auth
+    c. program membaca folder tadi
+    d. program jalan sesuai dengan waktu cron yang ada di supabase

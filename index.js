@@ -1,76 +1,64 @@
 import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
 import axios from 'axios';
 import cron from 'node-cron';
 import express from 'express';
+import moment from 'moment-timezone';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import { createClient } from '@supabase/supabase-js';
-import moment from 'moment-timezone';
+import AdmZip from 'adm-zip';
 
 const { Client } = pkg;
 
 // === Supabase setup ===
-const supabaseUrl = 'https://njuwhppokcqtbgyornsn.supabase.co';
-const supabaseKey = process.env.SUPABASE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// === Session constants ===
-const SESSION_TABLE = 'wa_sessions';
-const SESSION_KEY = 'default';
-
-// === Load & Save Session ===
-async function loadSessionFromSupabase() {
-    const { data, error } = await supabase
-        .from(SESSION_TABLE)
-        .select('session_data')
-        .eq('key', SESSION_KEY)
-        .single();
-
-    if (error || !data?.session_data) {
-        console.warn('⚠️ Tidak ada sesi WhatsApp di Supabase.');
-        return undefined;
-    }
-
-    console.log('✅ Sesi WhatsApp dimuat dari Supabase.');
-    return data.session_data;
-}
-
-async function saveSessionToSupabase(session) {
-    if (
-        session &&
-        session.WABrowserId &&
-        session.WASecretBundle &&
-        session.WAToken1 &&
-        session.WAToken2
-    ) {
-        const { error } = await supabase
-            .from(SESSION_TABLE)
-            .upsert({ key: SESSION_KEY, session_data: session });
-
-        if (error) {
-            console.error('❌ Gagal menyimpan sesi ke Supabase:', error.message);
-        } else {
-            console.log('✅ Sesi WhatsApp disimpan ke Supabase.');
-        }
-    } else {
-        console.warn('⚠️ Session tidak lengkap, tidak disimpan.');
-    }
-}
-
-// === Target Nomor dari ENV ===
-const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
-    ? process.env.WA_TARGET_NUMBERS.split(',').map(num => num.trim()).filter(Boolean)
-    : [];
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const ZIP_FILE = 'session_default.zip';
+const BUCKET = 'wa-sessions';
+const SESSION_PATH = path.join('.wwebjs_auth', 'session', 'Default');
 
 let client;
 let clientReady = false;
 let activeJobs = [];
 
+// === Ambil session zip dari Supabase Storage ===
+async function extractSessionFromStorage() {
+    const { data, error } = await supabase
+        .storage
+        .from(BUCKET)
+        .download(ZIP_FILE);
+
+    if (error) {
+        console.error('❌ Gagal mengunduh ZIP session dari Supabase:', error.message);
+        return false;
+    }
+
+    const tempZipPath = path.join('.', ZIP_FILE);
+    fs.writeFileSync(tempZipPath, Buffer.from(await data.arrayBuffer()));
+
+    // Bersihkan dulu folder lama
+    if (fs.existsSync(SESSION_PATH)) {
+        fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+    }
+
+    // Ekstrak ZIP
+    const zip = new AdmZip(tempZipPath);
+    zip.extractAllTo(SESSION_PATH, true);
+    fs.unlinkSync(tempZipPath);
+
+    console.log('✅ Session berhasil diekstrak ke .wwebjs_auth/session/Default');
+    return true;
+}
+
+// === Inisialisasi WhatsApp client ===
 async function initWhatsappClient() {
-    const sessionData = await loadSessionFromSupabase();
+    const success = await extractSessionFromStorage();
 
     client = new Client({
-        session: sessionData
+        authStrategy: new pkg.LocalAuth({
+            dataPath: '.wwebjs_auth'
+        }),
     });
 
     client.on('qr', (qr) => {
@@ -78,24 +66,17 @@ async function initWhatsappClient() {
         qrcode.generate(qr, { small: true });
     });
 
-    client.on('authenticated', async (session) => {
-        console.log('🔐 Authenticated. Menyimpan sesi...');
-        await saveSessionToSupabase(session);
+    client.on('authenticated', () => {
+        console.log('🔐 Authenticated.');
     });
 
     client.on('ready', async () => {
         clientReady = true;
         console.log('✅ WhatsApp client is ready!');
-
-        if (client && client._session) {
-            console.log('💾 Menyimpan ulang session dari client._session');
-            await saveSessionToSupabase(client._session);
-        }
-
         await reloadCronSchedules();
     });
 
-    client.on('disconnected', async (reason) => {
+    client.on('disconnected', (reason) => {
         console.error('🔌 WhatsApp disconnected:', reason);
         clientReady = false;
     });
@@ -103,7 +84,7 @@ async function initWhatsappClient() {
     client.initialize();
 }
 
-// === Gold checking config ===
+// === Gold config ===
 async function getDynamicThreshold() {
     const { data, error } = await supabase
         .from('gold_config')
@@ -113,7 +94,7 @@ async function getDynamicThreshold() {
         .single();
 
     if (error) {
-        console.error('❌ Gagal mengambil threshold dari Supabase:', error.message);
+        console.error('❌ Gagal mengambil threshold:', error.message);
         return null;
     }
 
@@ -129,14 +110,14 @@ async function getCronTimes() {
         .single();
 
     if (error || !data?.cron_times) {
-        console.error('❌ Gagal mengambil cron_times dari Supabase:', error?.message || 'Tidak ada data.');
+        console.error('❌ Gagal mengambil cron_times:', error?.message || 'Tidak ada data.');
         return [];
     }
 
     return data.cron_times.split(',').map(str => str.trim()).filter(Boolean);
 }
 
-// === Cron job scheduler ===
+// === Penjadwalan ulang cron dari DB ===
 function clearAllJobs() {
     activeJobs.forEach(job => job.stop());
     activeJobs = [];
@@ -144,21 +125,13 @@ function clearAllJobs() {
 
 async function reloadCronSchedules() {
     clearAllJobs();
-
     const cronTimes = await getCronTimes();
-    if (cronTimes.length === 0) {
-        console.warn('⚠️ Tidak ada cron_times yang valid dari DB.');
-        return;
-    }
 
     for (const timeStr of cronTimes) {
         const [hour, minute] = timeStr.split(':').map(Number);
-        if (isNaN(hour) || isNaN(minute)) {
-            console.warn(`⚠️ Format waktu tidak valid: ${timeStr}`);
-            continue;
-        }
+        if (isNaN(hour) || isNaN(minute)) continue;
 
-        const utcHour = (hour - 7 + 24) % 24; // WIB → UTC
+        const utcHour = (hour - 7 + 24) % 24;
         const expression = `${minute} ${utcHour} * * *`;
 
         const job = cron.schedule(expression, () => {
@@ -173,68 +146,46 @@ async function reloadCronSchedules() {
     }
 }
 
-// === Fungsi utama ===
+// === Fungsi utama pengiriman WA ===
+const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
+    ? process.env.WA_TARGET_NUMBERS.split(',').map(n => n.trim()).filter(Boolean)
+    : [];
+
 async function checkGoldAndSend() {
     const now = new Date().toISOString();
     console.log(`🔍 Memulai pengecekan harga emas pada ${now}`);
 
-    if (!clientReady) {
-        console.warn('⚠️ WhatsApp belum siap, pengiriman dibatalkan.');
-        return;
-    }
-
-    if (TARGET_NUMBERS.length === 0) {
-        console.error('❗ TARGET_NUMBERS kosong. Harap isi WA_TARGET_NUMBERS di .env.');
-        return;
-    }
+    if (!clientReady || TARGET_NUMBERS.length === 0) return;
 
     const threshold = await getDynamicThreshold();
-    if (!threshold) {
-        console.error('❌ Threshold tidak tersedia. Proses dibatalkan.');
-        return;
-    }
+    if (!threshold) return;
 
     try {
-        const response = await axios.get('https://api.treasury.id/api/v1/antigrvty/gold/stats/buy', {
+        const res = await axios.get('https://api.treasury.id/api/v1/antigrvty/gold/stats/buy', {
             headers: {
                 'user-agent': 'Mozilla/5.0',
                 'origin': 'https://web.treasury.id',
-                'accept': 'application/json, text/plain, */*',
-                'accept-language': 'en,en-US;q=0.9,id;q=0.8'
+                'accept': 'application/json, text/plain, */*'
             }
         });
 
-        const dataArr = response.data.data;
-        if (!Array.isArray(dataArr) || dataArr.length === 0) {
-            console.warn('⚠️ Data emas kosong atau bukan array.');
-            return;
-        }
-
-        const latest = dataArr.reduce((a, b) => (a.id > b.id ? a : b));
-        console.log(`📦 Data terbaru: ID ${latest.id}, Harga: Rp${latest.buying_rate}, Tanggal: ${latest.date}`);
+        const latest = res.data.data.reduce((a, b) => (a.id > b.id ? a : b));
+        console.log(`📦 Data: ID ${latest.id}, Harga: Rp${latest.buying_rate}, Tanggal: ${latest.date}`);
 
         if (latest.buying_rate < threshold) {
-            console.log(`📉 Harga emas Rp${latest.buying_rate} < threshold Rp${threshold}, lanjut pengiriman.`);
-
-            const { data: existing, error: checkError } = await supabase
+            const { data: existing } = await supabase
                 .from('emasDB')
                 .select('id')
                 .eq('gold_id', latest.id)
                 .maybeSingle();
 
-            if (checkError) {
-                console.error('❌ Gagal memeriksa Supabase:', checkError.message);
-                return;
-            }
-
             if (existing) {
-                console.log(`🚫 gold_id ${latest.id} sudah pernah dikirim sebelumnya. Melewati.`);
+                console.log(`🚫 gold_id ${latest.id} sudah dikirim. Lewat.`);
                 return;
             }
 
-            const thisYear = new Date().getFullYear();
-            const fullDateStr = `${latest.date} ${thisYear}`;
-            const parsedDate = new Date(fullDateStr);
+            const year = new Date().getFullYear();
+            const parsedDate = new Date(`${latest.date} ${year}`);
             const formattedDate = formatCustomDate(parsedDate);
 
             for (const number of TARGET_NUMBERS) {
@@ -242,64 +193,51 @@ async function checkGoldAndSend() {
                 const message = `📉 Harga emas turun!\nHarga beli: Rp${latest.buying_rate}\nTanggal: ${latest.date}`;
 
                 try {
-                    console.log(`📤 Mengirim pesan ke ${number}...`);
                     await client.sendMessage(chatId, message);
-                    console.log(`✅ Pesan berhasil dikirim ke ${number}`);
+                    console.log(`✅ Terkirim ke ${number}`);
 
-                    const { error: insertError } = await supabase.from('emasDB').insert([{
+                    await supabase.from('emasDB').insert([{
                         buying_rate: latest.buying_rate,
                         sent_to: number,
                         sent_at: new Date().toISOString(),
                         date: formattedDate,
                         gold_id: latest.id
                     }]);
-
-                    if (insertError) {
-                        console.error(`❌ Gagal simpan ke Supabase untuk ${number}:`, insertError.message);
-                    } else {
-                        console.log(`✅ Disimpan ke Supabase untuk ${number}`);
-                    }
-
-                } catch (sendError) {
-                    console.error(`❌ Gagal kirim ke ${number}:`, sendError.message);
+                } catch (err) {
+                    console.error(`❌ Gagal kirim ke ${number}:`, err.message);
                 }
             }
-
         } else {
-            console.log(`ℹ️ Harga emas Rp${latest.buying_rate} ≥ threshold Rp${threshold}, tidak dikirim.`);
+            console.log(`ℹ️ Harga Rp${latest.buying_rate} ≥ threshold Rp${threshold}`);
         }
 
     } catch (err) {
-        if (err.response) {
-            console.error('❗ API Error:', err.response.status, err.response.data);
-        } else {
-            console.error('❗ Error saat ambil/proses data:', err.message);
-        }
+        console.error('❗ Gagal ambil harga emas:', err.message);
     }
 }
 
-function formatCustomDate(dateObj) {
-    const day = dateObj.getDate().toString().padStart(2, '0');
-    const month = dateObj.toLocaleString('en-US', { month: 'short' }).toUpperCase();
-    const year = dateObj.getFullYear();
-    const hours = dateObj.getHours().toString().padStart(2, '0');
-    const minutes = dateObj.getMinutes().toString().padStart(2, '0');
-    return `${day}-${month}-${year} ${hours}:${minutes}`;
+function formatCustomDate(date) {
+    const d = date.getDate().toString().padStart(2, '0');
+    const m = date.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+    const y = date.getFullYear();
+    const h = date.getHours().toString().padStart(2, '0');
+    const min = date.getMinutes().toString().padStart(2, '0');
+    return `${d}-${m}-${y} ${h}:${min}`;
 }
 
-// === Cron untuk reload jadwal ===
+// === Auto reload schedule tiap 30 menit ===
 cron.schedule('*/30 * * * *', reloadCronSchedules);
 
-// === Inisialisasi WA dan server ===
+// === Jalankan App ===
 initWhatsappClient();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (_, res) => {
-    res.send('✅ WhatsApp Bot is running (Render).');
+    res.send('✅ WhatsApp Bot is running (Render)');
 });
 
 app.listen(PORT, () => {
-    console.log(`🌐 Express server aktif di port ${PORT}`);
+    console.log(`🌐 Server aktif di port ${PORT}`);
 });
