@@ -3,7 +3,7 @@
 
 # WhatsApp session
 .wwebjs_auth/
-.webjs_cache/
+.wwebjs_cache/
 
 # Node modules (jika tidak perlu)
 node_modules/
