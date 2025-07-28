@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import axios from 'axios';
 import cron from 'node-cron';
@@ -5,25 +6,89 @@ import express from 'express';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import { createClient } from '@supabase/supabase-js';
+import moment from 'moment-timezone';
+import fs from 'fs';
 
-const { Client, LocalAuth } = pkg;
+const { Client } = pkg;
 
 // === Supabase setup ===
 const supabaseUrl = 'https://njuwhppokcqtbgyornsn.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// === WhatsApp setup ===
-const client = new Client({
-    authStrategy: new LocalAuth()
-});
+// === Session Key ===
+const SESSION_TABLE = 'wa_sessions';
+const SESSION_KEY = 'default';
 
-// === Target Nomor dari ENV ===
+async function loadSessionFromSupabase() {
+    const { data, error } = await supabase
+        .from(SESSION_TABLE)
+        .select('session_data')
+        .eq('key', SESSION_KEY)
+        .single();
+
+    if (error || !data?.session_data) {
+        console.warn('⚠️ Tidak ada sesi WhatsApp di Supabase.');
+        return undefined;
+    }
+
+    console.log('✅ Sesi WhatsApp dimuat dari Supabase.');
+    return data.session_data;
+}
+
+async function saveSessionToSupabase(session) {
+    const { error } = await supabase
+        .from(SESSION_TABLE)
+        .upsert({ key: SESSION_KEY, session_data: session });
+
+    if (error) {
+        console.error('❌ Gagal menyimpan sesi ke Supabase:', error.message);
+    } else {
+        console.log('✅ Sesi WhatsApp disimpan ke Supabase.');
+    }
+}
+
+// === WhatsApp setup ===
+let client;
+let clientReady = false;
+
+async function initWhatsappClient() {
+    const sessionData = await loadSessionFromSupabase();
+
+    client = new pkg.Client({
+        session: sessionData
+    });
+
+    client.on('qr', (qr) => {
+        console.log('🟡 Scan QR berikut untuk login:\n');
+        qrcode.generate(qr, { small: true });
+    });
+
+    client.on('authenticated', async (session) => {
+        await saveSessionToSupabase(session);
+    });
+
+    client.on('ready', async () => {
+        clientReady = true;
+        console.log('✅ WhatsApp client is ready!');
+        await reloadCronSchedules();
+    });
+
+    client.on('disconnected', async (reason) => {
+        console.error('🔌 WhatsApp disconnected:', reason);
+        clientReady = false;
+    });
+
+    client.initialize();
+}
+
+// === Supabase config ===
 const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
     ? process.env.WA_TARGET_NUMBERS.split(',').map(num => num.trim()).filter(Boolean)
     : [];
 
-// === Ambil threshold dari Supabase ===
+let activeJobs = [];
+
 async function getDynamicThreshold() {
     const { data, error } = await supabase
         .from('gold_config')
@@ -40,10 +105,65 @@ async function getDynamicThreshold() {
     return parseInt(data.threshold, 10);
 }
 
-// === Fungsi Utama: Mengecek dan Kirim WA ===
+async function getCronTimes() {
+    const { data, error } = await supabase
+        .from('gold_config')
+        .select('cron_times')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .single();
+
+    if (error || !data?.cron_times) {
+        console.error('❌ Gagal mengambil cron_times dari Supabase:', error?.message || 'Tidak ada data.');
+        return [];
+    }
+
+    return data.cron_times.split(',').map(str => str.trim()).filter(Boolean);
+}
+
+function clearAllJobs() {
+    activeJobs.forEach(job => job.stop());
+    activeJobs = [];
+}
+
+async function reloadCronSchedules() {
+    clearAllJobs();
+
+    const cronTimes = await getCronTimes();
+    if (cronTimes.length === 0) {
+        console.warn('⚠️ Tidak ada cron_times yang valid dari DB.');
+        return;
+    }
+
+    for (const timeStr of cronTimes) {
+        const [hour, minute] = timeStr.split(':').map(Number);
+        if (isNaN(hour) || isNaN(minute)) {
+            console.warn(`⚠️ Format waktu tidak valid: ${timeStr}`);
+            continue;
+        }
+
+        const wibHour = (hour - 7 + 24) % 24;
+        const expression = `${minute} ${wibHour} * * *`;
+        const job = cron.schedule(expression, () => {
+            const nowWIB = moment().tz('Asia/Jakarta');
+            if (nowWIB.hour() === hour && nowWIB.minute() === minute && clientReady) {
+                checkGoldAndSend();
+            }
+        });
+
+        activeJobs.push(job);
+        console.log(`⏳ Menjadwalkan cron job (WIB ${timeStr}): ${expression} (UTC)`);
+    }
+}
+
 async function checkGoldAndSend() {
     const now = new Date().toISOString();
     console.log(`🔍 Memulai pengecekan harga emas pada ${now}`);
+
+    if (!clientReady) {
+        console.warn('⚠️ WhatsApp belum siap, pengiriman dibatalkan.');
+        return;
+    }
 
     if (TARGET_NUMBERS.length === 0) {
         console.error('❗ TARGET_NUMBERS kosong. Harap isi WA_TARGET_NUMBERS di .env.');
@@ -140,7 +260,6 @@ async function checkGoldAndSend() {
     }
 }
 
-// === Format Tanggal ===
 function formatCustomDate(dateObj) {
     const day = dateObj.getDate().toString().padStart(2, '0');
     const month = dateObj.toLocaleString('en-US', { month: 'short' }).toUpperCase();
@@ -150,26 +269,10 @@ function formatCustomDate(dateObj) {
     return `${day}-${month}-${year} ${hours}:${minutes}`;
 }
 
-// === WhatsApp QR login ===
-client.on('qr', (qr) => {
-    console.log('🟡 Scan QR berikut untuk login:\n');
-    qrcode.generate(qr, { small: true });
-});
+cron.schedule('*/30 * * * *', reloadCronSchedules);
 
-// === WhatsApp siap digunakan ===
-client.on('ready', () => {
-    console.log('✅ WhatsApp client is ready!');
-    console.log('⏳ Menjadwalkan cron job pukul 10:00 dan 20:00...');
-    cron.schedule('0 0 10,20 * * *', checkGoldAndSend); // jam 10 dan 20
-});
+initWhatsappClient();
 
-client.on('disconnected', (reason) => {
-    console.error('🔌 WhatsApp disconnected:', reason);
-});
-
-client.initialize();
-
-// === Web server dummy (agar Render tidak error) ===
 const app = express();
 const PORT = process.env.PORT || 3000;
 
