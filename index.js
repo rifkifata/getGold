@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import axios from 'axios';
 import cron from 'node-cron';
+import express from 'express';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
-const { Client, LocalAuth } = pkg;
 import { createClient } from '@supabase/supabase-js';
+
+const { Client, LocalAuth } = pkg;
 
 // === Supabase setup ===
 const supabaseUrl = 'https://njuwhppokcqtbgyornsn.supabase.co';
@@ -21,6 +23,7 @@ const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
     ? process.env.WA_TARGET_NUMBERS.split(',').map(num => num.trim()).filter(Boolean)
     : [];
 
+// === Ambil threshold dari Supabase ===
 async function getDynamicThreshold() {
     const { data, error } = await supabase
         .from('gold_config')
@@ -37,6 +40,7 @@ async function getDynamicThreshold() {
     return parseInt(data.threshold, 10);
 }
 
+// === Fungsi Utama: Mengecek dan Kirim WA ===
 async function checkGoldAndSend() {
     const now = new Date().toISOString();
     console.log(`🔍 Memulai pengecekan harga emas pada ${now}`);
@@ -72,7 +76,7 @@ async function checkGoldAndSend() {
         console.log(`📦 Data terbaru: ID ${latest.id}, Harga: Rp${latest.buying_rate}, Tanggal: ${latest.date}`);
 
         if (latest.buying_rate < threshold) {
-            console.log(`📉 Harga emas Rp${latest.buying_rate} < threshold Rp${threshold}, lanjut pengecekan.`);
+            console.log(`📉 Harga emas Rp${latest.buying_rate} < threshold Rp${threshold}, lanjut pengiriman.`);
 
             const { data: existing, error: checkError } = await supabase
                 .from('emasDB')
@@ -86,7 +90,7 @@ async function checkGoldAndSend() {
             }
 
             if (existing) {
-                console.log(`🚫 gold_id ${latest.id} sudah pernah dikirim sebelumnya. Melewati pengiriman.`);
+                console.log(`🚫 gold_id ${latest.id} sudah pernah dikirim sebelumnya. Melewati.`);
                 return;
             }
 
@@ -113,9 +117,9 @@ async function checkGoldAndSend() {
                     }]);
 
                     if (insertError) {
-                        console.error(`❌ Gagal menyimpan ke Supabase untuk ${number}:`, insertError.message);
+                        console.error(`❌ Gagal simpan ke Supabase untuk ${number}:`, insertError.message);
                     } else {
-                        console.log(`✅ Data berhasil disimpan ke Supabase untuk ${number}`);
+                        console.log(`✅ Disimpan ke Supabase untuk ${number}`);
                     }
 
                 } catch (sendError) {
@@ -131,11 +135,12 @@ async function checkGoldAndSend() {
         if (err.response) {
             console.error('❗ API Error:', err.response.status, err.response.data);
         } else {
-            console.error('❗ Error saat ambil atau proses data:', err.message);
+            console.error('❗ Error saat ambil/proses data:', err.message);
         }
     }
 }
 
+// === Format Tanggal ===
 function formatCustomDate(dateObj) {
     const day = dateObj.getDate().toString().padStart(2, '0');
     const month = dateObj.toLocaleString('en-US', { month: 'short' }).toUpperCase();
@@ -151,11 +156,11 @@ client.on('qr', (qr) => {
     qrcode.generate(qr, { small: true });
 });
 
-// === WhatsApp client connection ===
+// === WhatsApp siap digunakan ===
 client.on('ready', () => {
     console.log('✅ WhatsApp client is ready!');
-    console.log('⏳ Inisialisasi cron schedule setiap 30 detik...');
-    cron.schedule('0 0 10,20 * * *', checkGoldAndSend);
+    console.log('⏳ Menjadwalkan cron job pukul 10:00 dan 20:00...');
+    cron.schedule('0 0 10,20 * * *', checkGoldAndSend); // jam 10 dan 20
 });
 
 client.on('disconnected', (reason) => {
@@ -163,3 +168,15 @@ client.on('disconnected', (reason) => {
 });
 
 client.initialize();
+
+// === Web server dummy (agar Render tidak error) ===
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (_, res) => {
+    res.send('✅ WhatsApp Bot is running (Render).');
+});
+
+app.listen(PORT, () => {
+    console.log(`🌐 Express server aktif di port ${PORT}`);
+});
