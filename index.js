@@ -4,55 +4,53 @@ import cron from 'node-cron';
 import express from 'express';
 import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
-import { createClient } from '@supabase/supabase-js';
-import moment from 'moment-timezone';
 import fs from 'fs';
 import path from 'path';
 import fetch from 'node-fetch';
-import unzipper from 'unzipper';
+import moment from 'moment-timezone';
+import { createClient } from '@supabase/supabase-js';
+import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
+import qrcodeImage from 'qrcode';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const { Client, LocalAuth } = pkg;
 
 // === Supabase setup ===
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const BUCKET = 'wa-sessions';
-const ZIP_NAME = 'session_default.zip';
-const ZIP_DEST = `.wwebjs_auth/session/Default`;
 
-// === Download & extract session zip ===
-async function extractSessionZipFromSupabase() {
-    const url = `${process.env.SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${ZIP_NAME}`;
-    const response = await fetch(url, {
-        headers: {
-            apikey: process.env.SUPABASE_KEY,
-            Authorization: `Bearer ${process.env.SUPABASE_KEY}`
+// === Bersihkan folder session/cache lama ===
+function cleanSessionFolders() {
+    const sessionPath = path.join(__dirname, '.wwebjs_auth');
+    const cachePath = path.join(__dirname, '.wwebjs_cache');
+    [sessionPath, cachePath].forEach(dir => {
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            console.log(`🧹 Folder ${dir} dihapus.`);
         }
     });
-
-    if (!response.ok) {
-        console.warn(`⚠️ Gagal mengunduh ZIP dari Supabase: ${response.statusText}`);
-        return false;
-    }
-
-    if (fs.existsSync(ZIP_DEST)) {
-        fs.rmSync(ZIP_DEST, { recursive: true, force: true });
-    }
-    fs.mkdirSync(ZIP_DEST, { recursive: true });
-
-    await new Promise((resolve, reject) => {
-        response.body
-            .pipe(unzipper.Extract({ path: ZIP_DEST }))
-            .on('close', resolve)
-            .on('error', reject);
-    });
-
-    console.log(`✅ Session berhasil diekstrak ke ${ZIP_DEST}`);
-    return true;
 }
 
-// === WhatsApp client setup ===
-let clientReady = false;
+// === Upload QR image ke Supabase ===
+async function uploadQRImage(buffer) {
+    const filename = `qr-${uuidv4()}.png`;
+    const { error } = await supabase.storage.from(BUCKET).upload(filename, buffer, {
+        contentType: 'image/png',
+        upsert: true
+    });
+
+    if (error) {
+        console.error('❌ Gagal upload QR ke Supabase:', error.message);
+    } else {
+        const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
+        console.log(`☁️ QR code juga diunggah ke Supabase:\n${publicUrl}`);
+    }
+}
+
+// === WA Client init ===
 let client;
+let clientReady = false;
 let activeJobs = [];
 
 const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
@@ -60,7 +58,7 @@ const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
     : [];
 
 async function initWhatsappClient() {
-    const success = await extractSessionZipFromSupabase();
+    cleanSessionFolders();
 
     client = new Client({
         authStrategy: new LocalAuth({
@@ -68,10 +66,16 @@ async function initWhatsappClient() {
         })
     });
 
-    client.on('qr', qr => {
+    client.on('qr', async qr => {
         console.log('🟡 Scan QR berikut untuk login:\n');
         qrcode.generate(qr, { small: true });
-        if (!success) console.warn('⚠️ QR muncul karena session tidak berhasil dimuat dari Supabase.');
+
+        try {
+            const buffer = await qrcodeImage.toBuffer(qr, { type: 'png' });
+            await uploadQRImage(buffer);
+        } catch (err) {
+            console.error('❌ Gagal generate/upload QR:', err.message);
+        }
     });
 
     client.on('authenticated', () => {
@@ -81,6 +85,13 @@ async function initWhatsappClient() {
     client.on('ready', async () => {
         clientReady = true;
         console.log('✅ WhatsApp client is ready!');
+
+        // Cek apakah folder baru terbentuk setelah login
+        const folderPath = path.join('.wwebjs_auth', 'session', 'Default');
+        if (fs.existsSync(folderPath)) {
+            console.log(`📁 Folder session berhasil dibuat oleh WhatsApp: ${folderPath}`);
+        }
+
         await reloadCronSchedules();
     });
 
@@ -187,10 +198,10 @@ async function checkGoldAndSend() {
     }
 }
 
-// === Cron Reload Jadwal ===
+// === Jadwal refresh cron setiap 30 menit ===
 cron.schedule('*/30 * * * *', reloadCronSchedules);
 
-// === Inisialisasi WA dan Express ===
+// === Mulai ===
 initWhatsappClient();
 
 const app = express();
