@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import axios from 'axios';
 import cron from 'node-cron';
@@ -7,7 +6,6 @@ import pkg from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import { createClient } from '@supabase/supabase-js';
 import moment from 'moment-timezone';
-import fs from 'fs';
 
 const { Client } = pkg;
 
@@ -16,10 +14,11 @@ const supabaseUrl = 'https://njuwhppokcqtbgyornsn.supabase.co';
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// === Session Key ===
+// === Session constants ===
 const SESSION_TABLE = 'wa_sessions';
 const SESSION_KEY = 'default';
 
+// === Load & Save Session ===
 async function loadSessionFromSupabase() {
     const { data, error } = await supabase
         .from(SESSION_TABLE)
@@ -37,25 +36,40 @@ async function loadSessionFromSupabase() {
 }
 
 async function saveSessionToSupabase(session) {
-    const { error } = await supabase
-        .from(SESSION_TABLE)
-        .upsert({ key: SESSION_KEY, session_data: session });
+    if (
+        session &&
+        session.WABrowserId &&
+        session.WASecretBundle &&
+        session.WAToken1 &&
+        session.WAToken2
+    ) {
+        const { error } = await supabase
+            .from(SESSION_TABLE)
+            .upsert({ key: SESSION_KEY, session_data: session });
 
-    if (error) {
-        console.error('❌ Gagal menyimpan sesi ke Supabase:', error.message);
+        if (error) {
+            console.error('❌ Gagal menyimpan sesi ke Supabase:', error.message);
+        } else {
+            console.log('✅ Sesi WhatsApp disimpan ke Supabase.');
+        }
     } else {
-        console.log('✅ Sesi WhatsApp disimpan ke Supabase.');
+        console.warn('⚠️ Session tidak lengkap, tidak disimpan.');
     }
 }
 
-// === WhatsApp setup ===
+// === Target Nomor dari ENV ===
+const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
+    ? process.env.WA_TARGET_NUMBERS.split(',').map(num => num.trim()).filter(Boolean)
+    : [];
+
 let client;
 let clientReady = false;
+let activeJobs = [];
 
 async function initWhatsappClient() {
     const sessionData = await loadSessionFromSupabase();
 
-    client = new pkg.Client({
+    client = new Client({
         session: sessionData
     });
 
@@ -65,12 +79,19 @@ async function initWhatsappClient() {
     });
 
     client.on('authenticated', async (session) => {
+        console.log('🔐 Authenticated. Menyimpan sesi...');
         await saveSessionToSupabase(session);
     });
 
     client.on('ready', async () => {
         clientReady = true;
         console.log('✅ WhatsApp client is ready!');
+
+        if (client && client._session) {
+            console.log('💾 Menyimpan ulang session dari client._session');
+            await saveSessionToSupabase(client._session);
+        }
+
         await reloadCronSchedules();
     });
 
@@ -82,13 +103,7 @@ async function initWhatsappClient() {
     client.initialize();
 }
 
-// === Supabase config ===
-const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
-    ? process.env.WA_TARGET_NUMBERS.split(',').map(num => num.trim()).filter(Boolean)
-    : [];
-
-let activeJobs = [];
-
+// === Gold checking config ===
 async function getDynamicThreshold() {
     const { data, error } = await supabase
         .from('gold_config')
@@ -121,6 +136,7 @@ async function getCronTimes() {
     return data.cron_times.split(',').map(str => str.trim()).filter(Boolean);
 }
 
+// === Cron job scheduler ===
 function clearAllJobs() {
     activeJobs.forEach(job => job.stop());
     activeJobs = [];
@@ -142,8 +158,9 @@ async function reloadCronSchedules() {
             continue;
         }
 
-        const wibHour = (hour - 7 + 24) % 24;
-        const expression = `${minute} ${wibHour} * * *`;
+        const utcHour = (hour - 7 + 24) % 24; // WIB → UTC
+        const expression = `${minute} ${utcHour} * * *`;
+
         const job = cron.schedule(expression, () => {
             const nowWIB = moment().tz('Asia/Jakarta');
             if (nowWIB.hour() === hour && nowWIB.minute() === minute && clientReady) {
@@ -156,6 +173,7 @@ async function reloadCronSchedules() {
     }
 }
 
+// === Fungsi utama ===
 async function checkGoldAndSend() {
     const now = new Date().toISOString();
     console.log(`🔍 Memulai pengecekan harga emas pada ${now}`);
@@ -269,8 +287,10 @@ function formatCustomDate(dateObj) {
     return `${day}-${month}-${year} ${hours}:${minutes}`;
 }
 
+// === Cron untuk reload jadwal ===
 cron.schedule('*/30 * * * *', reloadCronSchedules);
 
+// === Inisialisasi WA dan server ===
 initWhatsappClient();
 
 const app = express();
