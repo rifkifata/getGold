@@ -1,0 +1,12 @@
+# Environment file
+.env
+
+# WhatsApp session
+.wwebjs_auth/
+.webjs_cache/
+
+# Node modules (jika tidak perlu)
+node_modules/
+
+# Log files
+*.log
