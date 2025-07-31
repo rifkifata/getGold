@@ -69,7 +69,7 @@ async function fetchAndStoreLatestGoldData() {
 // === Konfigurasi Cron Job ===
 // Menjadwalkan tugas untuk berjalan setiap jam, pada menit ke-20.
 // Contoh: 01:20, 02:20, 03:20, dst.
-const cronSchedule = '40 * * * *'; // <<< PERUBAHAN DI SINI
+const cronSchedule = '50 * * * *'; // <<< PERUBAHAN DI SINI
 cron.schedule(cronSchedule, fetchAndStoreLatestGoldData, {
     timezone: "Asia/Jakarta"
 });
