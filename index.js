@@ -63,7 +63,7 @@ async function fetchAndStoreLatestGoldData() {
 }
 
 // === Jadwal Cron Job ===
-const cronSchedule = '5 * * * *'; // setiap jam pada menit ke-5
+const cronSchedule = '3 * * * *'; // setiap jam pada menit ke-5
 cron.schedule(cronSchedule, fetchAndStoreLatestGoldData, {
     timezone: "Asia/Jakarta"
 });
