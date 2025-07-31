@@ -2,211 +2,86 @@ import 'dotenv/config';
 import axios from 'axios';
 import cron from 'node-cron';
 import express from 'express';
-import pkg from 'whatsapp-web.js';
-import qrcode from 'qrcode-terminal';
-import fs from 'fs';
-import path from 'path';
-import fetch from 'node-fetch';
-import moment from 'moment-timezone';
 import { createClient } from '@supabase/supabase-js';
-import { fileURLToPath } from 'url';
-import { v4 as uuidv4 } from 'uuid';
-import qrcodeImage from 'qrcode';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const { Client, LocalAuth } = pkg;
-
-// === Supabase setup ===
+// === Konfigurasi Awal ===
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const BUCKET = 'wa-sessions';
+const GOLD_API_URL = 'https://api.treasury.id/api/v1/antigrvty/gold/stats/buy';
 
-// === Bersihkan folder session/cache lama ===
-function cleanSessionFolders() {
-    const sessionPath = path.join(__dirname, '.wwebjs_auth');
-    const cachePath = path.join(__dirname, '.wwebjs_cache');
-    [sessionPath, cachePath].forEach(dir => {
-        if (fs.existsSync(dir)) {
-            fs.rmSync(dir, { recursive: true, force: true });
-            console.log(`🧹 Folder ${dir} dihapus.`);
-        }
-    });
-}
-
-// === Upload QR image ke Supabase ===
-async function uploadQRImage(buffer) {
-    const filename = `qr-${uuidv4()}.png`;
-    const { error } = await supabase.storage.from(BUCKET).upload(filename, buffer, {
-        contentType: 'image/png',
-        upsert: true
-    });
-
-    if (error) {
-        console.error('❌ Gagal upload QR ke Supabase:', error.message);
-    } else {
-        const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
-        console.log(`☁️ QR code juga diunggah ke Supabase:\n${publicUrl}`);
-    }
-}
-
-// === WA Client init ===
-let client;
-let clientReady = false;
-let activeJobs = [];
-
-const TARGET_NUMBERS = process.env.WA_TARGET_NUMBERS
-    ? process.env.WA_TARGET_NUMBERS.split(',').map(s => s.trim()).filter(Boolean)
-    : [];
-
-async function initWhatsappClient() {
-    cleanSessionFolders();
-
-    client = new Client({
-        authStrategy: new LocalAuth({
-            dataPath: '.wwebjs_auth'
-        })
-    });
-
-    client.on('qr', async qr => {
-        console.log('🟡 Scan QR berikut untuk login:\n');
-        qrcode.generate(qr, { small: true });
-
-        try {
-            const buffer = await qrcodeImage.toBuffer(qr, { type: 'png' });
-            await uploadQRImage(buffer);
-        } catch (err) {
-            console.error('❌ Gagal generate/upload QR:', err.message);
-        }
-    });
-
-    client.on('authenticated', () => {
-        console.log('🔐 WhatsApp berhasil diautentikasi.');
-    });
-
-    client.on('ready', async () => {
-        clientReady = true;
-        console.log('✅ WhatsApp client is ready!');
-
-        // Cek apakah folder baru terbentuk setelah login
-        const folderPath = path.join('.wwebjs_auth', 'session', 'Default');
-        if (fs.existsSync(folderPath)) {
-            console.log(`📁 Folder session berhasil dibuat oleh WhatsApp: ${folderPath}`);
-        }
-
-        await reloadCronSchedules();
-    });
-
-    client.on('disconnected', reason => {
-        console.error('🔌 WhatsApp disconnected:', reason);
-        clientReady = false;
-    });
-
-    client.initialize();
-}
-
-// === Konfigurasi dari Supabase ===
-async function getDynamicThreshold() {
-    const { data, error } = await supabase
-        .from('gold_config')
-        .select('threshold')
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .single();
-    if (error) {
-        console.error('❌ Gagal ambil threshold:', error.message);
-        return null;
-    }
-    return parseInt(data.threshold, 10);
-}
-
-async function getCronTimes() {
-    const { data, error } = await supabase
-        .from('gold_config')
-        .select('cron_times')
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .single();
-    if (error || !data?.cron_times) {
-        console.error('❌ Gagal ambil cron_times:', error?.message || 'Tidak ada data');
-        return [];
-    }
-    return data.cron_times.split(',').map(str => str.trim());
-}
-
-// === Cron job manager ===
-function clearAllJobs() {
-    activeJobs.forEach(job => job.stop());
-    activeJobs = [];
-}
-
-async function reloadCronSchedules() {
-    clearAllJobs();
-    const cronTimes = await getCronTimes();
-
-    for (const timeStr of cronTimes) {
-        const [hour, minute] = timeStr.split(':').map(Number);
-        if (isNaN(hour) || isNaN(minute)) continue;
-        const utcHour = (hour - 7 + 24) % 24;
-        const expr = `${minute} ${utcHour} * * *`;
-        cron.schedule(expr, () => {
-            const nowWIB = moment().tz('Asia/Jakarta');
-            if (nowWIB.hour() === hour && nowWIB.minute() === minute && clientReady) {
-                checkGoldAndSend();
-            }
-        });
-        activeJobs.push(expr);
-        console.log(`⏳ Menjadwalkan cron job (WIB ${timeStr}): ${expr} (UTC)`);
-    }
-}
-
-// === Fungsi utama: Cek harga dan kirim WA ===
-async function checkGoldAndSend() {
-    console.log(`🔍 Cek harga emas ${new Date().toISOString()}`);
-    if (!clientReady) return;
-
-    const threshold = await getDynamicThreshold();
-    if (!threshold) return;
+/**
+ * Fungsi utama untuk mengambil data harga emas dan menyimpan HANYA DATA TERBARU ke Supabase.
+ */
+async function fetchAndStoreLatestGoldData() {
+    console.log(`[${new Date().toISOString()}] 🚀 Memulai proses pengambilan data harga emas...`);
 
     try {
-        const { data } = await axios.get('https://api.treasury.id/api/v1/antigrvty/gold/stats/buy');
-        const latest = data.data.reduce((a, b) => (a.id > b.id ? a : b));
-        if (latest.buying_rate >= threshold) return;
+        const { data: apiResponse } = await axios.get(GOLD_API_URL);
 
-        const { data: exist } = await supabase
+        if (!apiResponse || !apiResponse.data || apiResponse.data.length === 0) {
+            console.log('⚠️ API tidak mengembalikan data yang valid atau array kosong.');
+            return;
+        }
+
+        const latestData = apiResponse.data.reduce((latest, current) => {
+            return current.id > latest.id ? current : latest;
+        });
+
+        console.log(`ℹ️ Data terbaru ditemukan: ID=${latestData.id}, Harga=${latestData.buying_rate}`);
+
+        const { data: existingRecord, error: checkError } = await supabase
             .from('emasDB')
             .select('id')
-            .eq('gold_id', latest.id)
+            .eq('gold_id', latestData.id)
             .maybeSingle();
 
-        if (exist) return;
-
-        const date = new Date(`${latest.date} ${new Date().getFullYear()}`);
-        const formatted = `${date.getDate()}-${date.toLocaleString('en-US', { month: 'short' }).toUpperCase()}-${date.getFullYear()}`;
-
-        for (const num of TARGET_NUMBERS) {
-            const msg = `📉 Harga emas turun!\nHarga beli: Rp${latest.buying_rate}\nTanggal: ${latest.date}`;
-            await client.sendMessage(`${num}@c.us`, msg);
-            await supabase.from('emasDB').insert([{
-                buying_rate: latest.buying_rate,
-                sent_to: num,
-                sent_at: new Date().toISOString(),
-                date: formatted,
-                gold_id: latest.id
-            }]);
+        if (checkError) {
+            console.error('❌ Gagal saat memeriksa data di Supabase:', checkError.message);
+            return;
         }
-    } catch (err) {
-        console.error('❌ Error saat ambil data emas:', err.message);
+
+        if (existingRecord) {
+            console.log(`🤫 Data dengan ID ${latestData.id} sudah ada. Tidak ada data baru yang disimpan.`);
+            return;
+        }
+
+        console.log(`➕ Menambahkan data baru dengan ID ${latestData.id} ke Supabase...`);
+        const { error: insertError } = await supabase
+            .from('emasDB')
+            .insert([
+                {
+                    gold_id: latestData.id,
+                    buying_rate: latestData.buying_rate,
+                    date: latestData.date,
+                },
+            ]);
+
+        if (insertError) {
+            console.error('❌ Gagal memasukkan data ke Supabase:', insertError.message);
+        } else {
+            console.log(`✅ Sukses! Data terbaru berhasil disimpan.`);
+        }
+
+    } catch (error) {
+        console.error('❌ Terjadi kesalahan selama proses:', error.message);
     }
 }
 
-// === Jadwal refresh cron setiap 30 menit ===
-cron.schedule('*/30 * * * *', reloadCronSchedules);
+// === Konfigurasi Cron Job ===
+// Menjadwalkan tugas untuk berjalan setiap jam, pada menit ke-20.
+// Contoh: 01:20, 02:20, 03:20, dst.
+const cronSchedule = '40 * * * *'; // <<< PERUBAHAN DI SINI
+cron.schedule(cronSchedule, fetchAndStoreLatestGoldData, {
+    timezone: "Asia/Jakarta"
+});
 
-// === Mulai ===
-initWhatsappClient();
+console.log(`⏳ Cron job dijadwalkan dengan pola "${cronSchedule}" (WIB).`);
 
+// === Konfigurasi Server Express untuk Health Check ===
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (_, res) => res.send('✅ WhatsApp Bot is running.'));
+app.get('/', (req, res) => {
+    res.send('✅ Gold Price Data Collector is running.');
+});
 app.listen(PORT, () => {
-    console.log(`🌐 Express aktif di port ${PORT}`);
+    console.log(`🌐 Server berjalan di port ${PORT}.`);
 });
